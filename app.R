@@ -1,185 +1,199 @@
 library(shiny)
+library(httr)
+library(jsonlite)
+library(stringr)
+library(dplyr)
+library(readr)
+library(ggplot2)
 
-# File where data is stored
-data_file <- "points.txt"
+# =========================
+# CONFIG
+# =========================
 
-# Load or initialize data
-load_data <- function() {
-  if (file.exists(data_file)) {
-    read.csv(data_file, stringsAsFactors = FALSE)
+META_FILE <- "meta_counts.csv"
+
+# IMPORTANT:
+# Replace this with the correct Limitless endpoint for deck data.
+# Example placeholder:
+LIMITLESS_URL <- "https://play.limitlesstcg.com/api/tournaments/6a19c09b47f3797bf6ba6859/standings"
+
+API_KEY <- NULL   # If you have one, put it here.
+
+
+# =========================
+# HELPERS
+# =========================
+
+load_meta <- function() {
+  if (file.exists(META_FILE)) {
+    read_csv(META_FILE, show_col_types = FALSE)
   } else {
-    data.frame(name = character(), points = numeric(), stringsAsFactors = FALSE)
+    tibble(archetype = character(), count = integer())
   }
 }
 
-save_data <- function(df) {
-  write.csv(df, data_file, row.names = FALSE)
+save_meta <- function(df) {
+  write_csv(df, META_FILE)
 }
 
+fetch_limitless_decks <- function(limit = 128) {
+  if (LIMITLESS_URL == "<PUT_LIMITLESS_DECKS_ENDPOINT_HERE>") {
+    warning("Please configure LIMITLESS_URL in app.R")
+    return(tibble())
+  }
+
+  headers <- list()
+  if (!is.null(API_KEY)) headers[["X-Access-Key"]] <- API_KEY
+
+  res <- GET(LIMITLESS_URL, add_headers(.headers = headers), query = list(limit = limit))
+  stop_for_status(res)
+
+  json <- content(res, as = "parsed", simplifyVector = TRUE)
+
+  # Expecting list of deck objects with $deck$icons
+  if (!"deck" %in% names(json[[1]])) {
+    warning("Unexpected JSON structure. Check API endpoint.")
+    return(tibble())
+  }
+
+  tibble(
+    name = sapply(json, function(x) x$deck$name),
+    icon = sapply(json, function(x) ifelse(length(x$deck$icons) > 0, x$deck$icons[1], NA))
+  )
+}
+
+extract_attacker_words <- function(deck_names) {
+  words <- unlist(str_split(deck_names, "\\s+"))
+  words <- unique(words)
+  words <- words[nchar(words) > 2]
+  words <- words[!words %in% c("and", "with", "the", "Box", "Control", "Toolbox", "Deck")]
+  words
+}
+
+detect_archetype <- function(deck_text, icons, attacker_words) {
+
+  # 1) Try icon match
+  icon_hits <- sapply(icons, function(ic) str_count(deck_text, fixed(ic, ignore_case = TRUE)))
+  if (any(icon_hits > 0)) {
+    return(icons[which.max(icon_hits)])
+  }
+
+  # 2) Try attacker name match
+  attacker_hits <- sapply(attacker_words, function(a) str_count(deck_text, fixed(a, ignore_case = TRUE)))
+  if (any(attacker_hits > 0)) {
+    return(attacker_words[which.max(attacker_hits)])
+  }
+
+  # 3) Fallback
+  return("Others")
+}
+
+
+# =========================
+# UI
+# =========================
+
 ui <- fluidPage(
-  titlePanel("Daily Username Points & Token Tracker"),
+  titlePanel("Pokémon Decklist Meta Share Tracker"),
 
   sidebarLayout(
     sidebarPanel(
-      textInput("username", "Enter Username Abbreviation"),
-      actionButton("add_user", "Add Daily Point"),
+      h4("Submit Decklist"),
+      textareaInput("deck_input", "Paste Decklist (Limitless style)", rows = 15, width = "100%"),
+      actionButton("submit_btn", "Submit Decklist", class = "btn-primary"),
 
       hr(),
-
-      sliderInput("challenge_points", "Challenger Points", min = -10, max = 10, value = 1),
-      actionButton("apply_challenge", "Apply Challenger Points"),
-
-      hr(),
-      h4("Monthly Settings"),
-
-      sliderInput("days_total", "Days in Month", min = 1, max = 31, value = 30),
-      sliderInput("challenger_daily", "Avg Challenger Points per Day", min = 0, max = 10, value = 1),
-
-      hr(),
-      h4("Max Tokens per Participant"),
-      textOutput("max_tokens_display"),
-
-      hr(),
-      h4("Price Wall"),
-      uiOutput("price_wall")
+      textOutput("status")
     ),
 
     mainPanel(
-      h3("Usernames"),
-      uiOutput("user_list"),
-
+      h3("Meta Share"),
+      plotOutput("meta_plot"),
       hr(),
-      h3("Monthly Ranking"),
-      tableOutput("ranking")
+      tableOutput("meta_table")
     )
   )
 )
 
+
+# =========================
+# SERVER
+# =========================
+
 server <- function(input, output, session) {
 
-  # Reactive data frame
-  users <- reactiveVal(load_data())
+  meta <- reactiveVal(load_meta())
 
-  # Save whenever data changes
-  observeEvent(users(), {
-    save_data(users())
-  })
+  # Fetch Limitless decks on startup
+  limitless_data <- reactiveVal(tibble())
 
-  # Add daily point (1 point per day)
-  observeEvent(input$add_user, {
-    req(input$username)
-    df <- users()
-
-    if (input$username %in% df$name) {
-      df$points[df$name == input$username] <- df$points[df$name == input$username] + 1
-    } else {
-      df <- rbind(df, data.frame(name = input$username, points = 1))
-    }
-
-    users(df)
-  })
-
-  # Apply challenger points
-  observeEvent(input$apply_challenge, {
-    req(input$username)
-    df <- users()
-
-    if (input$username %in% df$name) {
-      df$points[df$name == input$username] <- df$points[df$name == input$username] + input$challenge_points
-    }
-
-    users(df)
-  })
-
-  # Token calculation
-  tokens <- reactive({
-    df <- users()
-    if (nrow(df) == 0) return(df)
-
-    # 1 Token = 2 daily points + 1 challenger point
-    df$tokens <- floor(df$points / 2)
-    df
-  })
-
-  # Max tokens per participant
-  max_tokens <- reactive({
-    days <- input$days_total
-    challenger <- input$challenger_daily
-
-    # Max tokens = (2 daily points + 1 challenger point) * days / 2
-    floor((days * (2 + challenger)) / 2)
-  })
-
-  output$max_tokens_display <- renderText({
-    paste(max_tokens(), "tokens")
-  })
-
-  # Price wall
-  output$price_wall <- renderUI({
-    max_t <- max_tokens()
-
-    tagList(
-      h4("Small Prize: 1 Token"),
-      h4(paste("Mini Acrylic:", max_t, "Tokens")),
-      h4(paste("Prize Pack:", max_t * 0.5, "Tokens"))
-    )
-  })
-
-  # Clickable usernames
-  output$user_list <- renderUI({
-    df <- tokens()
-
-    if (nrow(df) == 0) return("No users yet.")
-
-    tagList(
-      lapply(1:nrow(df), function(i) {
-        name <- df$name[i]
-        points <- df$points[i]
-        tks <- df$tokens[i]
-
-        actionButton(
-          inputId = paste0("user_", i),
-          label = paste0(name, " (", points, " pts, ", tks, " tokens)"),
-          width = "250px"
-        )
-      })
-    )
-  })
-
-  # Modify points when clicking a username
   observe({
-    df <- users()
-
-    lapply(1:nrow(df), function(i) {
-      btn <- paste0("user_", i)
-
-      observeEvent(input[[btn]], {
-        showModal(modalDialog(
-          title = paste("Modify Points for", df$name[i]),
-          sliderInput("modify_slider", "Adjust Points", min = -10, max = 10, value = 1),
-          footer = tagList(
-            modalButton("Cancel"),
-            actionButton("confirm_modify", "Apply")
-          )
-        ))
-
-        observeEvent(input$confirm_modify, {
-          df2 <- users()
-          df2$points[i] <- df2$points[i] + input$modify_slider
-          users(df2)
-          removeModal()
-        }, ignoreInit = TRUE)
-      })
-    })
+    decks <- fetch_limitless_decks(100)
+    limitless_data(decks)
   })
 
-  # Monthly ranking
-  output$ranking <- renderTable({
-    df <- tokens()
+  # Build attacker list
+  attacker_words <- reactive({
+    decks <- limitless_data()
+    if (nrow(decks) == 0) return(character())
+    extract_attacker_words(decks$name)
+  })
+
+  # Build icon list
+  icon_list <- reactive({
+    decks <- limitless_data()
+    decks$icon[!is.na(decks$icon)]
+  })
+
+  output$status <- renderText({
+    paste(
+      "Loaded attackers:", length(attacker_words()),
+      "| Loaded icons:", length(icon_list()),
+      "| Meta entries:", nrow(meta())
+    )
+  })
+
+  # Handle submission
+  observeEvent(input$submit_btn, {
+    req(input$deck_input)
+
+    arche <- detect_archetype(
+      deck_text = input$deck_input,
+      icons = icon_list(),
+      attacker_words = attacker_words()
+    )
+
+    df <- meta()
+
+    if (arche %in% df$archetype) {
+      df$count[df$archetype == arche] <- df$count[df$archetype == arche] + 1
+    } else {
+      df <- bind_rows(df, tibble(archetype = arche, count = 1))
+    }
+
+    meta(df)
+    save_meta(df)
+  })
+
+  # Plot
+  output$meta_plot <- renderPlot({
+    df <- meta()
     if (nrow(df) == 0) return(NULL)
 
-    df <- df[order(-df$tokens), ]
-    df
+    df <- df %>% mutate(share = count / sum(count) * 100)
+
+    ggplot(df, aes(x = reorder(archetype, share), y = share)) +
+      geom_col(fill = "#4C72B0") +
+      coord_flip() +
+      labs(x = "Archetype", y = "Meta Share (%)") +
+      theme_minimal(base_size = 14)
+  })
+
+  # Table
+  output$meta_table <- renderTable({
+    df <- meta()
+    if (nrow(df) == 0) return(NULL)
+    df %>% mutate(share = round(count / sum(count) * 100, 1)) %>% arrange(desc(share))
   })
 }
 
