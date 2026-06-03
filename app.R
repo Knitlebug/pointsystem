@@ -99,7 +99,7 @@ ui <- fluidPage(
   sidebarLayout(
     sidebarPanel(
       h4("Submit Decklist"),
-      textareaInput("deck_input", "Paste Decklist (Limitless style)", rows = 15, width = "100%"),
+      textAreaInput("deck_input", "Paste Decklist (Limitless style)", rows = 15, width = "100%"),
       actionButton("submit_btn", "Submit Decklist", class = "btn-primary"),
 
       hr(),
