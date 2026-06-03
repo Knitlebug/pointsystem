@@ -12,12 +12,8 @@ library(ggplot2)
 
 META_FILE <- "meta_counts.csv"
 
-# IMPORTANT:
-# Replace this with the correct Limitless endpoint for deck data.
-# Example placeholder:
+# Your tournament standings endpoint
 LIMITLESS_URL <- "https://play.limitlesstcg.com/api/tournaments/6a19c09b47f3797bf6ba6859/standings"
-
-API_KEY <- NULL   # If you have one, put it here.
 
 
 # =========================
@@ -36,55 +32,72 @@ save_meta <- function(df) {
   write_csv(df, META_FILE)
 }
 
-fetch_limitless_decks <- function() {
-  
-  res <- httr::GET(LIMITLESS_URL)
-  httr::stop_for_status(res)
-  
-  json <- httr::content(res, as = "parsed", simplifyVector = FALSE)
-  
-  # json MUST be a list of entries
-  if (!is.list(json)) {
-    warning("Unexpected JSON structure")
-    return(tibble(name = character(), icon = character()))
-  }
-  
-  tibble(
-    name = sapply(json, function(x) x$deck$name),
-    icon = sapply(json, function(x)
-      if (!is.null(x$deck$icons) && length(x$deck$icons) > 0)
-        x$deck$icons[[1]]
-      else
-        NA
-    )
-  )
+# Normalize names so API icons and decklist attackers match better
+normalize_name <- function(x) {
+  x %>%
+    tolower() %>%
+    str_replace_all("-", " ") %>%
+    str_replace_all("ex", "") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_trim()
 }
 
+fetch_limitless_decks <- function() {
+  res <- GET(LIMITLESS_URL)
+  stop_for_status(res)
+
+  json <- content(res, as = "parsed", simplifyVector = FALSE)
+
+  if (!is.list(json) || length(json) == 0) {
+    warning("Unexpected JSON structure from Limitless.")
+    return(tibble(name = character(), icon = character()))
+  }
+
+  tibble(
+    name = sapply(json, function(x) {
+      if (!is.null(x$deck) && !is.null(x$deck$name)) x$deck$name else NA_character_
+    }),
+    icon = sapply(json, function(x) {
+      if (!is.null(x$deck) && !is.null(x$deck$icons) && length(x$deck$icons) > 0) {
+        x$deck$icons[[1]]
+      } else {
+        NA_character_
+      }
+    })
+  )
+}
 
 extract_attacker_words <- function(deck_names) {
   words <- unlist(str_split(deck_names, "\\s+"))
   words <- unique(words)
   words <- words[nchar(words) > 2]
-  words <- words[!words %in% c("and", "with", "the", "Box", "Control", "Toolbox", "Deck")]
-  words
+  words <- words[!tolower(words) %in% c("and", "with", "the", "box", "control", "toolbox", "deck")]
+  normalize_name(words)
 }
 
 detect_archetype <- function(deck_text, icons, attacker_words) {
-  
-  # 1) Try icon match
-  icon_hits <- sapply(icons, function(ic) str_count(deck_text, fixed(ic, ignore_case = TRUE)))
-  if (any(icon_hits > 0)) {
+  deck_text_norm <- normalize_name(deck_text)
+
+  # 1) Try icon match (normalized)
+  icon_hits <- sapply(icons, function(ic) {
+    str_count(deck_text_norm, fixed(ic))
+  })
+
+  if (length(icon_hits) > 0 && any(icon_hits > 0)) {
     return(icons[which.max(icon_hits)])
   }
-  
-  # 2) Try attacker name match
-  attacker_hits <- sapply(attacker_words, function(a) str_count(deck_text, fixed(a, ignore_case = TRUE)))
-  if (any(attacker_hits > 0)) {
+
+  # 2) Try attacker word match (normalized)
+  attacker_hits <- sapply(attacker_words, function(a) {
+    str_count(deck_text_norm, fixed(a))
+  })
+
+  if (length(attacker_hits) > 0 && any(attacker_hits > 0)) {
     return(attacker_words[which.max(attacker_hits)])
   }
-  
+
   # 3) Fallback
-  return("Others")
+  "Others"
 }
 
 
@@ -94,17 +107,17 @@ detect_archetype <- function(deck_text, icons, attacker_words) {
 
 ui <- fluidPage(
   titlePanel("Pokémon Decklist Meta Share Tracker"),
-  
+
   sidebarLayout(
     sidebarPanel(
       h4("Submit Decklist"),
       textAreaInput("deck_input", "Paste Decklist (Limitless style)", rows = 15, width = "100%"),
       actionButton("submit_btn", "Submit Decklist", class = "btn-primary"),
-      
+
       hr(),
       textOutput("status")
     ),
-    
+
     mainPanel(
       h3("Meta Share"),
       plotOutput("meta_plot"),
@@ -120,30 +133,31 @@ ui <- fluidPage(
 # =========================
 
 server <- function(input, output, session) {
-  
+
   meta <- reactiveVal(load_meta())
-  
+
   # Fetch Limitless decks on startup
   limitless_data <- reactiveVal(tibble())
-  
+
   observe({
     decks <- fetch_limitless_decks()
     limitless_data(decks)
   })
-  
-  # Build attacker list
+
+  # Build normalized attacker list
   attacker_words <- reactive({
     decks <- limitless_data()
     if (nrow(decks) == 0) return(character())
     extract_attacker_words(decks$name)
   })
-  
-  # Build icon list
+
+  # Build normalized icon list
   icon_list <- reactive({
     decks <- limitless_data()
-    decks$icon[!is.na(decks$icon)]
+    if (nrow(decks) == 0) return(character())
+    normalize_name(decks$icon[!is.na(decks$icon)])
   })
-  
+
   output$status <- renderText({
     paste(
       "Loaded attackers:", length(attacker_words()),
@@ -151,48 +165,51 @@ server <- function(input, output, session) {
       "| Meta entries:", nrow(meta())
     )
   })
-  
+
   # Handle submission
   observeEvent(input$submit_btn, {
     req(input$deck_input)
-    
+
     arche <- detect_archetype(
       deck_text = input$deck_input,
       icons = icon_list(),
       attacker_words = attacker_words()
     )
-    
+
     df <- meta()
-    
+
     if (arche %in% df$archetype) {
       df$count[df$archetype == arche] <- df$count[df$archetype == arche] + 1
     } else {
       df <- bind_rows(df, tibble(archetype = arche, count = 1))
     }
-    
+
     meta(df)
     save_meta(df)
   })
-  
+
   # Plot
   output$meta_plot <- renderPlot({
     df <- meta()
     if (nrow(df) == 0) return(NULL)
-    
+
     df <- df %>% mutate(share = count / sum(count) * 100)
-    
+
     ggplot(df, aes(x = reorder(archetype, share), y = share)) +
       geom_col(fill = "#4C72B0") +
       coord_flip() +
       labs(x = "Archetype", y = "Meta Share (%)") +
       theme_minimal(base_size = 14)
   })
-  
+
   # Table
   output$meta_table <- renderTable({
     df <- meta()
     if (nrow(df) == 0) return(NULL)
-    df %>% mutate(share = round(count / sum(count) * 100, 1)) %>% arrange(desc(share))
+
+    df %>%
+      mutate(share = round(count / sum(count) * 100, 1)) %>%
+      arrange(desc(share))
   })
 }
 
